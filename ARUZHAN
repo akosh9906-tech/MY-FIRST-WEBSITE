@@ -1,0 +1,280 @@
+{
+  "name": "zanai",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
+ANTHROPIC_API_KEY=sk-ant-ВАШ_КЛЮЧ
+MODEL=claude-sonnet-5-5
+PORT=3000
+require('dotenv').config();
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const PORT = process.env.PORT || 3000;
+const MODEL = process.env.MODEL || 'claude-sonnet-5-5';
+const KEY = process.env.ANTHROPIC_API_KEY;
+const DATA = path.join(__dirname, 'data');
+const UPLOADS = path.join(__dirname, 'uploads');
+[DATA, UPLOADS].forEach(d => fs.mkdirSync(d, { recursive: true }));
+
+const SYSTEM = `Ты — ZANAI, ИИ-помощник, который объясняет законы Республики Казахстан простым языком.
+Цель: чтобы человек знал свои права и не терял деньги, время и не сталкивался с несправедливостью.
+
+Как работать:
+1. Внимательно выслушай проблему. Если не хватает важных фактов (даты, суммы, кто стороны, есть ли договор) — задай 1–3 уточняющих вопроса.
+2. ВСЕГДА ищи актуальные нормы на сайте adilet.kz (инструмент поиска) и опирайся на них. Называй закон/кодекс, номер статьи и давай ссылку. Не выдумывай статьи: если не нашёл — так и скажи.
+3. Объясняй по этапам: «Что происходит по закону» → «Ваши права» → «Что делать пошагово» (какие документы собрать, куда обратиться: работодатель, трудовая инспекция, суд, прокуратура, акимат, ЦОН, egov.kz и т.д.) → «Сроки».
+4. Если пользователь прислал документ или фото (договор, приказ, уведомление) — разбери его: суть, риски, спорные пункты, что не соответствует закону, что стоит изменить.
+5. Темы: трудоустройство, жильё и аренда, договоры, потребительские права, семья, долги и кредиты, штрафы, налоги, наследство и др.
+6. Пиши простым языком, без лишнего юридического жаргона, коротко и структурно. Отвечай на языке пользователя (русский или казахский).
+7. В конце напоминай при серьёзных делах (суд, крупные суммы), что ты даёшь справочную информацию, а не заменяешь адвоката.`;
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS),
+    filename: (req, file, cb) =>
+      cb(null, crypto.randomUUID() + path.extname(file.originalname).toLowerCase())
+  }),
+  limits: { fileSize: 15 * 1024 * 1024, files: 5 }
+});
+
+// ---------- хранилище (JSON-файл на пользователя) ----------
+const safeId = s => String(s || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 64);
+const userFile = uid => path.join(DATA, safeId(uid) + '.json');
+const load = uid => {
+  try { return JSON.parse(fs.readFileSync(userFile(uid), 'utf8')); }
+  catch { return { chats: [] }; }
+};
+const save = (uid, db) => fs.writeFileSync(userFile(uid), JSON.stringify(db, null, 2));
+const uidOf = req => {
+  const id = safeId(req.get('x-user-id'));
+  return id.length >= 16 ? id : null;
+};
+
+// ---------- API ----------
+app.get('/api/chats', (req, res) => {
+  const uid = uidOf(req); if (!uid) return res.status(401).end();
+  res.json(load(uid).chats.map(({ id, title, updated }) => ({ id, title, updated }))
+    .sort((a, b) => b.updated - a.updated));
+});
+
+app.get('/api/chats/:id', (req, res) => {
+  const uid = uidOf(req); if (!uid) return res.status(401).end();
+  const chat = load(uid).chats.find(c => c.id === req.params.id);
+  chat ? res.json(chat) : res.status(404).end();
+});
+
+app.delete('/api/chats/:id', (req, res) => {
+  const uid = uidOf(req); if (!uid) return res.status(401).end();
+  const db = load(uid);
+  db.chats = db.chats.filter(c => c.id !== req.params.id);
+  save(uid, db);
+  res.json({ ok: true });
+});
+
+app.get('/files/:name', (req, res) => {
+  const uid = uidOf(req) || safeId(req.query.uid);
+  const name = path.basename(req.params.name);
+  const db = load(uid);
+  const owns = db.chats.some(c => c.messages.some(m => (m.files || []).some(f => f.stored === name)));
+  if (!owns) return res.status(403).end();
+  res.sendFile(path.join(UPLOADS, name));
+});
+
+const MEDIA = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
+
+function fileToBlock(f) {
+  const ext = path.extname(f.stored).toLowerCase();
+  const buf = fs.readFileSync(path.join(UPLOADS, f.stored));
+  if (MEDIA[ext]) return { type: 'image', source: { type: 'base64', media_type: MEDIA[ext], data: buf.toString('base64') } };
+  if (ext === '.pdf') return { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buf.toString('base64') } };
+  return { type: 'text', text: `Содержимое файла «${f.name}»:\n${buf.toString('utf8').slice(0, 60000)}` };
+}
+
+async function askClaude(messages) {
+  let msgs = messages;
+  for (let i = 0; i < 4; i++) {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 4000,
+        system: SYSTEM,
+        messages: msgs,
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5, allowed_domains: ['adilet.kz'] }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error?.message || 'Ошибка API');
+    if (data.stop_reason === 'pause_turn') {
+      msgs = [...msgs, { role: 'assistant', content: data.content }];
+      continue;
+    }
+    const sources = new Map();
+    let text = '';
+    for (const b of data.content) {
+      if (b.type !== 'text') continue;
+      text += b.text;
+      (b.citations || []).forEach(c => c.url && sources.set(c.url, c.title || c.url));
+    }
+    return { text: text.trim(), sources: [...sources].map(([url, title]) => ({ url, title })) };
+  }
+  throw new Error('Поиск занял слишком много времени, попробуйте ещё раз');
+}
+
+app.post('/api/chat', upload.array('files', 5), async (req, res) => {
+  try {
+    const uid = uidOf(req); if (!uid) return res.status(401).json({ error: 'Нет идентификатора' });
+    if (!KEY) return res.status(500).json({ error: 'Не задан ANTHROPIC_API_KEY в файле .env' });
+    const text = (req.body.message || '').trim();
+    const files = (req.files || []).map(f => ({ name: Buffer.from(f.originalname, 'latin1').toString('utf8'), stored: f.filename }));
+    if (!text && !files.length) return res.status(400).json({ error: 'Пустое сообщение' });
+
+    const db = load(uid);
+    let chat = db.chats.find(c => c.id === req.body.chatId);
+    if (!chat) {
+      chat = { id: crypto.randomUUID(), title: (text || files[0].name).slice(0, 50), updated: Date.now(), messages: [] };
+      db.chats.push(chat);
+    }
+    chat.messages.push({ role: 'user', content: text, files, time: Date.now() });
+
+    const history = chat.messages.slice(0, -1).slice(-20).map(m => ({
+      role: m.role,
+      content: m.content + ((m.files || []).length ? `\n[Прикреплено: ${m.files.map(f => f.name).join(', ')}]` : '')
+    })).filter(m => m.content);
+    const current = [...files.map(fileToBlock),
+      { type: 'text', text: text || 'Проанализируй приложенный документ: объясни суть, риски и что делать.' }];
+    const msgs = [...history, { role: 'user', content: current }];
+
+    const answer = await askClaude(msgs);
+    chat.messages.push({ role: 'assistant', content: answer.text, sources: answer.sources, time: Date.now() });
+    chat.updated = Date.now();
+    save(uid, db);
+    res.json({ chatId: chat.id, title: chat.title, user: { files }, answer });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`ZANAI запущен: http://localhost:${PORT}`));
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZANAI — законы Казахстана простым языком</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside id="side">
+  <div class="brand"><span class="sun"></span>ZANAI</div>
+  <button id="newChat" class="primary">Новый вопрос</button>
+  <nav id="chatList" aria-label="История чатов"></nav>
+  <p class="note">ZANAI даёт справочную информацию по законам РК и не заменяет адвоката.</p>
+</aside>
+<main>
+  <header>
+    <button id="menu" aria-label="Меню">☰</button>
+    <h1 id="title">Новый вопрос</h1>
+  </header>
+  <section id="log" aria-live="polite">
+    <div id="welcome">
+      <h2>Опишите проблему — ZANAI найдёт закон и подскажет, что делать</h2>
+      <p>Можно приложить фото или PDF договора, приказа, уведомления.</p>
+      <div class="chips">
+        <button>Работодатель не платит зарплату</button>
+        <button>Хозяин квартиры требует съехать</button>
+        <button>Проверить договор, который мне прислали</button>
+        <button>Вернуть деньги за некачественный товар</button>
+      </div>
+    </div>
+  </section>
+  <form id="form">
+    <div id="preview"></div>
+    <div class="row">
+      <label class="attach" title="Прикрепить фото или документ">
+        <input id="file" type="file" multiple accept="image/*,.pdf,.txt">📎
+      </label>
+      <textarea id="msg" rows="1" placeholder="Опишите ситуацию…"></textarea>
+      <button class="primary" id="send">Отправить</button>
+    </div>
+  </form>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
+:root{--ink:#10243a;--sky:#1a9bbd;--sun:#f2b705;--bg:#f4f7f9;--card:#fff;--line:#d9e2e8;--muted:#5d7080}
+@media(prefers-color-scheme:dark){:root{--ink:#e6eef4;--bg:#0e1a26;--card:#15263a;--line:#26394e;--muted:#93a6b6}}
+*{box-sizing:border-box}
+body{margin:0;display:flex;height:100vh;height:100dvh;font:16px/1.55 Onest,system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+button{font:inherit;cursor:pointer}
+:focus-visible{outline:3px solid var(--sun);outline-offset:2px}
+aside{width:280px;background:#10243a;color:#e6eef4;display:flex;flex-direction:column;padding:18px;gap:14px}
+.brand{font-weight:700;font-size:24px;letter-spacing:.04em;display:flex;align-items:center;gap:10px}
+.sun{width:18px;height:18px;border-radius:50%;background:var(--sun);box-shadow:0 0 0 4px #f2b70533}
+.primary{background:var(--sky);color:#fff;border:0;border-radius:10px;padding:10px 18px;font-weight:500}
+.primary:disabled{opacity:.5}
+#chatList{flex:1;overflow:auto;display:flex;flex-direction:column;gap:2px}
+#chatList div{display:flex;align-items:center;border-radius:8px}
+#chatList div.on,#chatList div:hover{background:#ffffff1a}
+#chatList button{background:none;border:0;color:inherit;text-align:left;padding:8px 10px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#chatList .del{flex:0;opacity:.6}
+.note{font-size:12px;color:#93a6b6;margin:0}
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+header{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+header h1{font-size:17px;margin:0;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#menu{display:none;background:none;border:0;font-size:22px;color:var(--ink)}
+#log{flex:1;overflow:auto;padding:24px 20px;display:flex;flex-direction:column;gap:16px}
+#welcome{margin:auto;max-width:620px;text-align:center}
+#welcome h2{font-size:28px;line-height:1.25;margin:0 0 8px}
+#welcome p{color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px}
+.chips button{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:8px 14px;color:var(--ink)}
+.chips button:hover{border-color:var(--sky)}
+.m{max-width:min(720px,92%);padding:12px 16px;border-radius:14px;overflow-wrap:anywhere}
+.m.user{align-self:flex-end;background:var(--sky);color:#fff;white-space:pre-wrap}
+.m.bot{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
+.m.bot p{margin:.4em 0}.m.bot ul,.m.bot ol{padding-left:22px;margin:.4em 0}
+.m.bot h3,.m.bot h4{margin:.8em 0 .2em}
+.m a{color:var(--sky)}
+.m.user a{color:#fff}
+.src{margin-top:10px;padding-top:8px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
+.src a{display:block}
+.files{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+.files img{max-height:120px;border-radius:8px}
+.files span{background:#ffffff33;border-radius:6px;padding:2px 8px;font-size:14px}
+.typing{color:var(--muted);font-style:italic}
+form{padding:12px 20px 18px;background:var(--card);border-top:1px solid var(--line)}
+.row{display:flex;gap:10px;align-items:flex-end}
+textarea{flex:1;resize:none;max-height:160px;border:1px solid var(--line);border-radius:12px;padding:10px 14px;font:inherit;background:var(--bg);color:var(--ink)}
+.attach{font-size:22px;cursor:pointer;padding:6px}
+.attach input{display:none}
+#preview{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+#preview span{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:2px 8px;font-size:14px;cursor:pointer}
+@media(max-width:760px){
+ aside{position:fixed;inset:0 auto 0 0;transform:translateX(-100%);transition:transform .2s;z-index:5}
+ aside.open{transform:none}
+ #menu{display:block}
+ #welcome h2{font-size:22px}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+npm install
+npm start
